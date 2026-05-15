@@ -1,0 +1,12 @@
+# SDVN-Security-CIA-Project — Python dependencies
+#
+# Install all with:  pip install -r requirements.txt
+
+# High-level cryptographic primitives: AES-GCM, ECDH, RSA, HMAC, X.509
+cryptography>=42.0.0
+
+# Supplementary symmetric and asymmetric crypto (used for DES/3DES contrast demos)
+pycryptodome>=3.20.0
+
+# Cross-platform ANSI colour codes for readable demo terminal output
+colorama>=0.4.6

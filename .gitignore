@@ -1,0 +1,55 @@
+# ── Python runtime artefacts ───────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ── Virtual environments ────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+.env/
+ENV/
+
+# ── Distribution / packaging ────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
+*.egg
+MANIFEST
+
+# ── Unit test / coverage reports ────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── IDE / editor files ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+*.sublime-project
+*.sublime-workspace
+
+# ── OS-generated files ──────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Secrets — NEVER commit real keys or certificates ────────────────────────
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+secrets.json
+secrets.yaml
+
+# ── Project-specific runtime outputs ────────────────────────────────────────
+# Blockchain ledger snapshots written during demos
+ledger_*.json
+# Session token dumps
+session_*.json
+# Demo log files
+*.log
