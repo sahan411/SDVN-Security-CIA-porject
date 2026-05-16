@@ -110,3 +110,8 @@ def verify_hmac(key: bytes, message: bytes, received_hmac: str) -> bool:
         # Any unexpected error (wrong type, zero-length key, etc.) is treated
         # as a verification failure rather than an unhandled exception.
         return False
+
+
+# Alias so demo_scenarios.py can call compute_hmac() without changing the
+# primary public name generate_hmac() used everywhere else.
+compute_hmac = generate_hmac

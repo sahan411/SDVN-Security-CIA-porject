@@ -131,16 +131,22 @@ REPLAY_WINDOW_SECONDS: float = 30.0
 # 256-bit pre-shared key used to bootstrap HMAC authentication before the ECDH
 # session key is established.  Both parties must hold this value out-of-band.
 # In a real SDVN deployment this would be provisioned during vehicle registration.
-PRE_SHARED_KEY: bytes = os.environb.get(
-    b"SDVN_PSK",
+def _env_bytes(var: str, default: bytes) -> bytes:
+    # os.environb is POSIX-only; on Windows we read the str env var and encode it.
+    raw = os.environ.get(var)
+    return raw.encode() if raw else default
+
+
+PRE_SHARED_KEY: bytes = _env_bytes(
+    "SDVN_PSK",
     b"PLACEHOLDER_32_BYTE_KEY_REPLACE_ME!"  # exactly 32 bytes — AES-256 compatible
 )
 
 # 256-bit key used exclusively for HMAC operations on BEACON messages.
 # Separating it from PRE_SHARED_KEY follows the principle of key separation:
 # a compromise of the HMAC key does not compromise AES confidentiality.
-HMAC_KEY: bytes = os.environb.get(
-    b"SDVN_HMAC_KEY",
+HMAC_KEY: bytes = _env_bytes(
+    "SDVN_HMAC_KEY",
     b"PLACEHOLDER_HMAC_KEY_32_BYTES!!"   # exactly 32 bytes
 )
 
