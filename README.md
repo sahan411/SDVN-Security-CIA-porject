@@ -75,31 +75,32 @@ pip install -r requirements.txt
 ## Running the Demo
 
 ```bash
-# Full interactive demo (all security properties)
+# Full live demo — all 4 scenarios in sequence (recommended)
 python demo/run_demo.py
 
-# Run a specific scenario
-python demo/run_demo.py --scenario confidentiality
-python demo/run_demo.py --scenario integrity
-python demo/run_demo.py --scenario authentication
-python demo/run_demo.py --scenario non_repudiation
-python demo/run_demo.py --scenario availability
+# Run a single scenario
+python demo/run_demo.py --scenario 1   # Normal Secure Operation
+python demo/run_demo.py --scenario 2   # HMAC Bypass Attack
+python demo/run_demo.py --scenario 3   # Metric Tampering Attack
+python demo/run_demo.py --scenario 4   # Non-Repudiation Demonstration
 
-# Run the attack simulation
-python attacks/attack_simulator.py
+# Skip sleep pauses (faster, useful for CI or repeated testing)
+python demo/run_demo.py --no-delays
 ```
+
+> **Windows note:** if you see `UnicodeEncodeError`, run `$env:PYTHONIOENCODING = "utf-8"` in
+> PowerShell before launching the demo.
 
 ---
 
 ## Demo Scenarios
 
-| Scenario | What It Shows |
-|---|---|
-| `confidentiality` | Encrypts a vehicle metric with AES-256-GCM; shows ciphertext vs plaintext |
-| `integrity` | Mutates a packet in transit; HMAC check catches the tampering |
-| `authentication` | Full ECDH handshake between Vehicle and Controller |
-| `non_repudiation` | RSA-signs a METRIC message; verifies signature on Controller side |
-| `availability` | Simulates replay attack and flood; detection layer blocks both |
+| # | Scenario | Security Property | What It Shows |
+|---|---|---|---|
+| 1 | **Normal Secure Operation** | All five | ECDH handshake → AES-GCM beacons → hash-chained RSA-signed metrics → blockchain ledger |
+| 2 | **HMAC Bypass Attack** | Authentication | Attacker forges HMAC tag with random key; `verify_hmac()` constant-time check rejects it |
+| 3 | **Metric Tampering Attack** | Integrity | Attacker replays stale hash-chain link; parallel controller chain detects position mismatch |
+| 4 | **Non-Repudiation Demonstration** | Non-Repudiation | Attacker overwrites ledger entry; `verify_chain()` catches hash mismatch + invalid RSA signature |
 
 ---
 

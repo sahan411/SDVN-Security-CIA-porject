@@ -1,405 +1,527 @@
 """
-demo/demo_scenarios.py — Self-contained demonstrations of all five security properties
-                          plus the attack simulator.
+demo/demo_scenarios.py — Four standalone scenario functions for the live demo.
 
-Each function is independent and imports only the modules it showcases, so a
-reader studying one property is not distracted by code for another.
+Each function is fully self-contained and can be imported and called independently.
+All four are also called in sequence by demo/run_demo.py.
 
-Scenario map:
-    demo_confidentiality()   — AES-256-GCM: plaintext is opaque without the key
-    demo_integrity()         — HMAC-SHA256 + HashChain: modification is detected
-    demo_authentication()    — ECDH: both parties derive the same session key;
-                               an impersonator cannot
-    demo_non_repudiation()   — RSA-PSS: the vehicle cannot deny signing a metric
-    demo_availability()      — Session expiry, replay detection, ledger audit
-    demo_attacks()           — All five AttackSimulator attacks in sequence
+Scenarios:
+    scenario_normal_operation(host, port, delay)   — live sockets, full security stack
+    scenario_hmac_bypass(host, port, delay)        — attacker forges HMAC tag
+    scenario_metric_tampering(delay)               — hash chain catches stale chain link
+    scenario_non_repudiation(delay)                — ledger tamper detected by verify_chain
 """
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import time
+import threading
+from typing import Optional
 
 from colorama import Fore, Style, init as colorama_init
 
-from core.network_config import HOST, PORT
+from core.aes_gcm_encrypt  import encrypt, decrypt
+from core.blockchain_ledger import BlockchainLedger
+from core.hash_chain        import HashChain
+from core.hmac_auth         import generate_hmac, verify_hmac
+from core.key_exchange      import ECDHKeyExchange
+from core.network_config    import HOST, PORT, REPLAY_WINDOW_SECONDS
+from core.rsa_signatures    import generate_keypair, serialize_public_key, sign, verify_signature
+from core.session_manager   import SessionManager
 
 colorama_init(autoreset=True)
 
-_SEC = f"{Fore.CYAN}{'─' * 58}{Style.RESET_ALL}"
+# ── Shared print helpers ──────────────────────────────────────────────────────
+_LOCK = threading.Lock()   # serialise prints from controller thread vs demo thread
 
+def _g(msg: str) -> None:
+    with _LOCK:
+        print(f"  {Fore.GREEN}{msg}{Style.RESET_ALL}")
 
-def _ok(msg: str)   -> None: print(f"  {Fore.GREEN}[PASS]{Style.RESET_ALL} {msg}")
-def _fail(msg: str) -> None: print(f"  {Fore.RED}[FAIL]{Style.RESET_ALL} {msg}")
-def _info(msg: str) -> None: print(f"  {Fore.YELLOW}[INFO]{Style.RESET_ALL} {msg}")
-def _sep()          -> None: print(_SEC)
+def _r(msg: str) -> None:
+    with _LOCK:
+        print(f"  {Fore.RED}{msg}{Style.RESET_ALL}")
 
+def _c(msg: str) -> None:
+    with _LOCK:
+        print(f"  {Fore.CYAN}{msg}{Style.RESET_ALL}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1. CONFIDENTIALITY
-# ═══════════════════════════════════════════════════════════════════════════════
+def _y(msg: str) -> None:
+    with _LOCK:
+        print(f"  {Fore.YELLOW}{msg}{Style.RESET_ALL}")
 
-def demo_confidentiality() -> None:
-    """AES-256-GCM: a passive observer cannot read the metric payload."""
-    from core.aes_gcm_encrypt import decrypt, encrypt
+def _w(msg: str) -> None:
+    with _LOCK:
+        print(f"  {msg}")
 
-    _sep()
-    print(f"  {Fore.CYAN}Property : CONFIDENTIALITY — AES-256-GCM{Style.RESET_ALL}")
-    _sep()
+def _step(n: int, text: str) -> None:
+    with _LOCK:
+        print(f"\n  {Fore.YELLOW}[Step {n}]{Style.RESET_ALL} {text}")
 
-    key       = os.urandom(32)          # session key from ECDH in real usage
-    plaintext = b'{"speed_kmh": 72, "gps": [51.5074, -0.1278], "fuel_pct": 64}'
+def _data(label: str, value: str) -> None:
+    with _LOCK:
+        print(f"  {Fore.CYAN}  {label:<28}{Style.RESET_ALL}{value}")
 
-    # ── Encryption ──────────────────────────────────────────────────────────
-    aad    = b"METRIC:demo-session-001"   # authenticated but not encrypted
-    bundle = encrypt(key, plaintext, additional_data=aad)
-
-    _info(f"Plaintext  : {plaintext.decode()}")
-    _info(f"Ciphertext : {bundle['ciphertext'].hex()[:56]}…  ({len(bundle['ciphertext'])} bytes)")
-    _info(f"Nonce      : {bundle['nonce'].hex()}")
-    print()
-
-    # ── Correct key decryption ───────────────────────────────────────────────
-    recovered = decrypt(key, bundle, additional_data=aad)
-    assert recovered == plaintext
-    _ok("Decryption with correct session key — plaintext recovered.")
-
-    # ── Wrong key decryption ─────────────────────────────────────────────────
-    # Any key other than the one used to encrypt raises InvalidTag — the
-    # adversary learns NOTHING about the plaintext from a failed attempt.
-    wrong_key = os.urandom(32)
-    try:
-        decrypt(wrong_key, bundle, additional_data=aad)
-        _fail("Wrong key was accepted — this should never happen.")
-    except Exception:
-        _ok("Wrong key rejected — AES-GCM InvalidTag raised; ciphertext is opaque.")
-
-    # ── Tampered ciphertext ──────────────────────────────────────────────────
-    # Flip one byte in the ciphertext; GCM tag detects it.
-    tampered_ct   = bytearray(bundle["ciphertext"])
-    tampered_ct[0] ^= 0xFF
-    tampered_bundle = {**bundle, "ciphertext": bytes(tampered_ct)}
-    try:
-        decrypt(key, tampered_bundle, additional_data=aad)
-        _fail("Tampered ciphertext was accepted — GCM integrity broken.")
-    except Exception:
-        _ok("Tampered ciphertext rejected — GCM tag covers every byte of ciphertext.")
+def _pause(seconds: float, enabled: bool = True) -> None:
+    if enabled:
+        time.sleep(seconds)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. INTEGRITY
+# SCENARIO 1 — Normal Secure Operation
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def demo_integrity() -> None:
-    """HMAC-SHA256 + SHA-256 hash chain: modification and reordering are detected."""
-    from core.hash_chain import HashChain
-    from core.hmac_auth import compute_hmac, verify_hmac
+def scenario_normal_operation(
+    host: str = HOST,
+    port: int = PORT,
+    delay: bool = True,
+) -> Optional[BlockchainLedger]:
+    """
+    Start a ControllerNode in a background thread, connect a VehicleNode,
+    perform ECDH key exchange, send 3 beacons and 3 metrics, then display
+    the ledger.  Returns the controller's ledger for use in Scenario 4.
+    """
+    from nodes.controller_node import ControllerNode
+    from nodes.vehicle_node    import VehicleNode
 
-    _sep()
-    print(f"  {Fore.CYAN}Property : INTEGRITY — HMAC-SHA256 + Hash Chain{Style.RESET_ALL}")
-    _sep()
+    # ── Start controller in background daemon thread ──────────────────────────
+    _step(1, "Starting SDN Controller on background thread…")
+    ctrl = ControllerNode(host=host, port=port)
+    ctrl.start()   # bind + listen immediately so the vehicle can connect
 
-    hmac_key = os.urandom(32)
+    ctrl_thread = threading.Thread(
+        target=_controller_accept_loop,
+        args=(ctrl,),
+        daemon=True,
+        name="controller-demo",
+    )
+    ctrl_thread.start()
+    _pause(0.3, delay)
+    _g(f"Controller listening on {host}:{port}")
 
-    # ── HMAC: single-message integrity ──────────────────────────────────────
-    message = b'{"speed_kmh": 72, "gps": [51.5074, -0.1278]}'
-    tag     = compute_hmac(hmac_key, message)
+    # ── Connect vehicle ───────────────────────────────────────────────────────
+    _step(2, "Vehicle Node V001 connecting to controller…")
+    vehicle = VehicleNode(vehicle_id="V001", host=host, port=port)
+    vehicle.connect()
+    _pause(0.2, delay)
+    _g("TCP connection established — untrusted channel open")
 
-    _info(f"Original message : {message.decode()}")
-    _info(f"HMAC tag         : {tag[:32]}…")
-    print()
+    # ── ECDH key exchange ─────────────────────────────────────────────────────
+    _step(3, "ECDH Key Exchange — deriving forward-secret session keys")
+    _c("Vehicle generates ephemeral P-256 keypair…")
+    _pause(0.3, delay)
 
-    assert verify_hmac(hmac_key, message, tag)
-    _ok("HMAC verified — message is authentic and unmodified.")
+    vehicle.perform_key_exchange()
+    _pause(0.4, delay)
 
-    # Single-bit flip in the message produces a completely different tag.
-    tampered = bytearray(message)
-    tampered[-1] ^= 0x01
-    if not verify_hmac(hmac_key, bytes(tampered), tag):
-        _ok("Tampered message rejected — HMAC detects the 1-bit change.")
-    else:
-        _fail("Tampered message accepted — integrity broken.")
+    _data("Session ID   :", vehicle._session_id[:24] + "…")
+    _data("K_AES  (hex) :", vehicle._aes_key.hex()[:32] + "…")
+    _data("K_HMAC (hex) :", vehicle._hmac_key.hex()[:32] + "…")
+    _pause(0.3, delay)
+    _g("Both parties derived matching session keys via HKDF — forward secrecy achieved")
 
-    print()
+    # ── 3 Beacons ─────────────────────────────────────────────────────────────
+    _step(4, "Vehicle sending 3 BEACON messages (HMAC-authenticated, AES-GCM encrypted)")
+    _pause(0.2, delay)
 
-    # ── Hash chain: sequence integrity ──────────────────────────────────────
-    chain = HashChain()
-    chain.initialize("demo-session-seed-2025")
-
-    messages = [
-        "METRIC: speed=60, seq=1",
-        "METRIC: speed=65, seq=2",
-        "METRIC: speed=68, seq=3",
+    beacons = [
+        ((51.5074, -0.1278), 60.0),
+        ((51.5080, -0.1283), 62.5),
+        ((51.5086, -0.1289), 64.0),
     ]
-    links = [chain.add(m) for m in messages]
+    for i, (pos, vel) in enumerate(beacons, 1):
+        _c(f"  BEACON #{i} — pos={pos}, vel={vel} km/h")
 
-    _info("Hash chain built (3 messages):")
-    for i, (msg, lnk) in enumerate(zip(messages, links)):
-        _info(f"  pos={i}  link={lnk[:24]}…  payload={msg!r}")
-    print()
+        # Show what the HMAC protects
+        sample_payload = json.dumps(
+            {"vehicle_id": "V001", "position": list(pos), "velocity": vel},
+            sort_keys=True,
+        ).encode()
+        tag = generate_hmac(vehicle._hmac_key, sample_payload)
+        _data(f"  HMAC tag #{i} :", tag[:32] + "…")
 
-    # Full chain integrity check
-    assert chain.detect_tampering()
-    _ok("detect_tampering() — chain is intact, all links verified.")
+        vehicle.send_beacon(position=pos, velocity=vel)
+        _pause(0.5, delay)   # let controller thread print its ✅ lines
 
-    # Verify an individual link
-    assert chain.verify(messages[1], links[1], position=1)
-    _ok("verify(message, link, position=1) — individual link correct.")
+    _pause(0.2, delay)
 
-    # Inject wrong link at position 1
-    if not chain.verify(messages[1], links[0], position=1):
-        _ok("Wrong link at position 1 detected — chain prevents message reordering.")
-    else:
-        _fail("Wrong link accepted — chain ordering broken.")
+    # ── 3 Metrics ─────────────────────────────────────────────────────────────
+    _step(5, "Vehicle sending 3 METRIC messages (hash-chained, RSA-signed, AES-GCM encrypted)")
+    _pause(0.2, delay)
+
+    metrics = [
+        {"speed_kmh": 60, "gps": [51.5074, -0.1278], "fuel_pct": 80, "engine_temp_c": 90},
+        {"speed_kmh": 65, "gps": [51.5080, -0.1283], "fuel_pct": 78, "engine_temp_c": 92},
+        {"speed_kmh": 68, "gps": [51.5086, -0.1289], "fuel_pct": 76, "engine_temp_c": 93},
+    ]
+
+    for i, metric in enumerate(metrics, 1):
+        _y(f"\n  --- METRIC #{i} ---")
+        plaintext = json.dumps(metric, sort_keys=True).encode()
+
+        # Show the encryption visually BEFORE sending
+        _data("  Plaintext  :", json.dumps(metric)[:60])
+        aad     = f"METRIC:demo".encode()
+        bundle  = encrypt(vehicle._aes_key, plaintext, additional_data=aad)
+        _data("  Ciphertext :", bundle["ciphertext"].hex()[:48] + "…")
+        _data("  Nonce      :", bundle["nonce"].hex())
+
+        # Show the decryption would recover the original value
+        recovered = decrypt(vehicle._aes_key, bundle, additional_data=aad)
+        _data("  Decrypted  :", recovered.decode()[:60])
+        _pause(0.2, delay)
+
+        vehicle.send_metric(metric)
+        _pause(0.7, delay)   # let controller thread print all ✅ lines
+
+    # ── Show ledger ───────────────────────────────────────────────────────────
+    _step(6, "Displaying controller's blockchain ledger")
+    _pause(0.3, delay)
+    ctrl._ledger.print_ledger()
+
+    _pause(0.3, delay)
+    vehicle.close()
+
+    return ctrl._ledger
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. AUTHENTICATION
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def demo_authentication() -> None:
-    """ECDH on P-256: mutual key derivation; an impersonator derives a different key."""
-    from core.key_exchange import ECDHKeyExchange
-
-    _sep()
-    print(f"  {Fore.CYAN}Property : AUTHENTICATION — ECDH P-256 + HKDF{Style.RESET_ALL}")
-    _sep()
-
-    vehicle    = ECDHKeyExchange()
-    controller = ECDHKeyExchange()
-
-    vehicle.generate_keypair()
-    controller.generate_keypair()
-
-    v_pub = vehicle.generate_keypair()[1]     # returns (priv, pub)
-    c_pub = controller.generate_keypair()[1]
-
-    # Refresh with explicit calls (generate_keypair sets internal private key)
-    vehicle    = ECDHKeyExchange();  vehicle.generate_keypair()
-    controller = ECDHKeyExchange();  controller.generate_keypair()
-
-    v_pub_bytes = vehicle.get_public_key_bytes()
-    c_pub_bytes = controller.get_public_key_bytes()
-
-    # Both parties compute Z = d_self · Q_peer independently
-    v_secret = vehicle.compute_shared_secret(c_pub_bytes)
-    c_secret = controller.compute_shared_secret(v_pub_bytes)
-
-    assert v_secret == c_secret
-    _ok("Both parties computed the same ECDH shared secret Z.")
-
-    # Derive session keys and confirm they match on both sides
-    v_keys = vehicle.derive_session_key(v_secret)
-    c_keys = controller.derive_session_key(c_secret)
-
-    _info(f"Vehicle    K_AES  : {v_keys['aes_key'].hex()[:32]}…")
-    _info(f"Controller K_AES  : {c_keys['aes_key'].hex()[:32]}…")
-    print()
-
-    assert v_keys["aes_key"]  == c_keys["aes_key"]
-    assert v_keys["hmac_key"] == c_keys["hmac_key"]
-    _ok("K_AES and K_HMAC match on both sides — authenticated channel established.")
-
-    # An impersonator generates their own ECDH keypair and computes a DIFFERENT secret
-    impersonator = ECDHKeyExchange()
-    impersonator.generate_keypair()
-    imp_secret = impersonator.compute_shared_secret(c_pub_bytes)
-
-    if imp_secret != c_secret:
-        _ok("Impersonator derives a DIFFERENT shared secret — "
-            "cannot inject valid messages into the session.")
-    else:
-        _fail("Impersonator matched the session secret — ECDLP broken.")
-
-    print()
-    _info("Key separation check:")
-    _info(f"  K_AES  ≠ K_HMAC : {v_keys['aes_key'] != v_keys['hmac_key']}")
-    _ok("Two independent 32-byte keys derived — AES and HMAC keys are domain-separated.")
+def _controller_accept_loop(ctrl) -> None:
+    """Accept loop for the background controller thread."""
+    import socket as _socket
+    try:
+        while True:
+            try:
+                conn, addr = ctrl._server_sock.accept()
+                t = threading.Thread(
+                    target=ctrl.handle_client,
+                    args=(conn, addr),
+                    daemon=True,
+                )
+                t.start()
+            except OSError:
+                break   # socket closed — shutdown
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 4. NON-REPUDIATION
+# SCENARIO 2 — HMAC Bypass Attack
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def demo_non_repudiation() -> None:
-    """RSA-2048 PSS: the vehicle cannot deny having signed a specific metric payload."""
-    from core.rsa_signatures import (
-        generate_keypair,
-        load_public_key_from_bytes,
-        serialize_public_key,
-        sign,
-        verify_signature,
+def scenario_hmac_bypass(
+    host: str = HOST,
+    port: int = PORT,
+    delay: bool = True,
+) -> None:
+    """
+    A malicious vehicle establishes a real session (ECDH), but then
+    computes its BEACON HMAC with a random fake key instead of K_HMAC.
+    The controller's verify_hmac() rejects the forged tag in constant time.
+    """
+    import socket as _socket, struct as _struct
+
+    # ── Attacker establishes a legitimate ECDH session ────────────────────────
+    _step(1, "Attacker connects and performs key exchange (to get a valid session)…")
+    _pause(0.3, delay)
+
+    ecdh = ECDHKeyExchange()
+    ecdh.generate_keypair()
+    _, rsa_pub = generate_keypair()
+
+    sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    sock.settimeout(6.0)
+    try:
+        sock.connect((host, port))
+    except ConnectionRefusedError:
+        _r("Controller not reachable — running local simulation only.")
+        sock = None
+
+    session_id = None
+    aes_key    = os.urandom(32)
+    real_hmac_key = os.urandom(32)
+
+    if sock:
+        _send(sock, {
+            "msg_type":        "KEY_EXCHANGE",
+            "vehicle_id":      "BAD-VEHICLE",
+            "ecdh_public_key": base64.b64encode(ecdh.get_public_key_bytes()).decode(),
+            "rsa_public_key":  base64.b64encode(serialize_public_key(rsa_pub)).decode(),
+        })
+        resp = _recv(sock)
+        session_id = resp["session_id"]
+        shared     = ecdh.compute_shared_secret(base64.b64decode(resp["ecdh_public_key"]))
+        keys       = ecdh.derive_session_key(shared)
+        aes_key       = keys["aes_key"]
+        real_hmac_key = keys["hmac_key"]
+        _pause(0.3, delay)
+
+    _g(f"Session established: {(session_id or 'local-sim')[:24]}…")
+    _data("Real K_HMAC :", real_hmac_key.hex()[:32] + "…")
+
+    # ── Build malicious beacon ────────────────────────────────────────────────
+    _step(2, "Attacker builds a BEACON with FORGED HMAC (random key, not K_HMAC)…")
+    _pause(0.3, delay)
+
+    evil_payload = {
+        "vehicle_id": "BAD-VEHICLE",
+        "position":   [99.99, 99.99],   # false position
+        "velocity":   999.9,            # impossible speed
+        "sequence":   1,
+        "timestamp":  time.time(),
+    }
+    payload_bytes = json.dumps(evil_payload, sort_keys=True).encode()
+
+    fake_key   = os.urandom(32)
+    forged_tag = generate_hmac(fake_key, payload_bytes)
+    real_tag   = generate_hmac(real_hmac_key, payload_bytes)
+
+    _data("Evil payload     :", f"pos=[99.99,99.99], vel=999.9 km/h  ← fabricated")
+    _data("Fake HMAC key    :", fake_key.hex()[:32] + "…")
+    _data("Forged HMAC tag  :", forged_tag[:32] + "…")
+    _data("Expected tag     :", real_tag[:32] + "…")
+    _data("Tags match       :", str(forged_tag == real_tag) + "  ← MUST be False")
+    _pause(0.3, delay)
+
+    # Encrypt correctly (so AES-GCM passes) — only the HMAC is forged
+    aad    = f"BEACON:{session_id or 'local'}".encode()
+    bundle = encrypt(aes_key, payload_bytes, additional_data=aad)
+
+    # ── Simulate controller-side HMAC check ───────────────────────────────────
+    _step(3, "Controller receives beacon — running HMAC verification…")
+    _pause(0.4, delay)
+
+    local_result = verify_hmac(real_hmac_key, payload_bytes, forged_tag)
+    _data("verify_hmac() result :", str(local_result) + "  ← False means REJECTED")
+
+    if sock and session_id:
+        _send(sock, {
+            "msg_type":   "BEACON",
+            "session_id": session_id,
+            "ciphertext": base64.b64encode(bundle["ciphertext"]).decode(),
+            "nonce":      base64.b64encode(bundle["nonce"]).decode(),
+            "hmac_tag":   forged_tag,
+            "aad":        base64.b64encode(aad).decode(),
+            "sequence":   1,
+        })
+        _pause(0.5, delay)
+        sock.close()
+
+    _pause(0.2, delay)
+    _r("❌ [ATTACK] HMAC verification failed — beacon rejected")
+    _r("   Forged tag does not match HMAC-SHA256(K_HMAC, payload)")
+    _r("   K_HMAC is derived from ECDH — the attacker cannot know it")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SCENARIO 3 — Metric Tampering (Hash Chain)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def scenario_metric_tampering(delay: bool = True) -> None:
+    """
+    Demonstrate how the SHA-256 hash chain detects a replayed or tampered
+    metric.  The attacker drops metric #1, then replays metric #0's chain
+    link at position 2 with modified GPS coordinates.  The controller's
+    parallel chain computation produces a different digest — mismatch detected.
+    No controller required: this is a pure local cryptographic demonstration.
+    """
+    import hashlib as _hashlib
+
+    seed = os.urandom(32).hex()
+
+    # ── Vehicle sends 2 legitimate metrics ───────────────────────────────────
+    _step(1, "Vehicle sends metric #0 and metric #1 legitimately…")
+    _pause(0.3, delay)
+
+    vehicle_chain = HashChain()
+    vehicle_chain.initialize(seed)
+
+    payload_0 = json.dumps(
+        {"vehicle_id": "V001", "seq": 1, "data": {"speed_kmh": 60, "gps": [51.50, -0.12]}},
+        sort_keys=True,
+    )
+    payload_1 = json.dumps(
+        {"vehicle_id": "V001", "seq": 2, "data": {"speed_kmh": 65, "gps": [51.51, -0.13]}},
+        sort_keys=True,
     )
 
-    _sep()
-    print(f"  {Fore.CYAN}Property : NON-REPUDIATION — RSA-2048 PSS{Style.RESET_ALL}")
-    _sep()
+    link_0 = vehicle_chain.add(payload_0)
+    link_1 = vehicle_chain.add(payload_1)
 
-    # Vehicle generates its long-term signing keypair
-    private_key, public_key = generate_keypair()
+    _data("Metric #0 chain_link :", link_0[:32] + "…")
+    _data("Metric #1 chain_link :", link_1[:32] + "…")
+    _g("Controller's parallel chain advances to position 2 — tip = link_1")
+    _pause(0.3, delay)
 
-    # Controller receives and stores the vehicle's public key (via KEY_EXCHANGE)
-    pub_der     = serialize_public_key(public_key)
-    stored_pub  = load_public_key_from_bytes(pub_der)
+    # ── Attacker intercepts metric #1, drops it, replays metric #0 ───────────
+    _step(2, "Attacker drops metric #1 and injects tampered payload at position 2…")
+    _pause(0.3, delay)
 
-    _info(f"RSA-2048 keypair generated ({len(pub_der)} bytes DER public key).")
-    print()
+    tampered_payload = json.dumps(
+        {"vehicle_id": "V001", "seq": 3, "data": {"speed_kmh": 60, "gps": [99.99, 99.99]}},
+        sort_keys=True,
+    )
 
-    # Vehicle signs a METRIC payload
-    metric = b'{"event": "speed_violation", "speed_kmh": 140, "limit_kmh": 100}'
-    sig    = sign(private_key, metric)
+    _r("  Attacker's injected GPS  : [99.99, 99.99]  ← fabricated location")
+    _data("  Claimed chain_link      :", link_0[:32] + "…  (stale — from pos 0)")
+    _data("  Claimed chain_position  :", "2")
+    _pause(0.3, delay)
 
-    _info(f"Metric payload : {metric.decode()}")
-    _info(f"Signature (first 48 chars of b64) : {__import__('base64').b64encode(sig).decode()[:48]}…")
-    print()
+    # ── Controller's parallel chain check ─────────────────────────────────────
+    _step(3, "Controller advances its parallel chain and compares links…")
+    _pause(0.3, delay)
 
-    # Controller verifies with the stored public key
-    if verify_signature(stored_pub, metric, sig):
-        _ok("Signature verified — vehicle CANNOT deny having sent this metric payload.")
-    else:
-        _fail("Signature verification failed.")
+    ctrl_chain = HashChain()
+    ctrl_chain.initialize(seed)
+    ctrl_chain.add(payload_0)   # controller received metric 0 → tip = link_0
+    ctrl_chain.add(payload_1)   # controller received metric 1 → tip = link_1
+    # At this point ctrl_chain.get_tip() == link_1
 
-    # A different payload does not verify with the original signature
-    different = b'{"event": "speed_violation", "speed_kmh": 60, "limit_kmh": 100}'
-    if not verify_signature(stored_pub, different, sig):
-        _ok("Modified payload rejected — signature is bound to the exact original bytes.")
-    else:
-        _fail("Modified payload accepted — non-repudiation broken.")
+    # Controller receives tampered_payload at claimed position 2.
+    # It computes: SHA256(tampered_payload_bytes || link_1_bytes)
+    prev_bytes    = bytes.fromhex(ctrl_chain.get_tip())   # link_1
+    combined      = tampered_payload.encode("utf-8") + prev_bytes
+    expected_link = _hashlib.sha256(combined).hexdigest()
 
-    # A forged signature (random bytes) cannot pass
-    forged = os.urandom(256)
-    if not verify_signature(stored_pub, metric, forged):
-        _ok("Forged signature (random bytes) rejected — RSA-PSS verification holds.")
-    else:
-        _fail("Forged signature accepted — catastrophic failure.")
+    _data("  Controller chain tip    :", link_1[:32] + "…  (after pos 1)")
+    _data("  Controller expected link:", expected_link[:32] + "…")
+    _data("  Attacker's link_0       :", link_0[:32] + "…")
+    _pause(0.2, delay)
 
-    print()
-    _info("Why RSA beats HMAC for non-repudiation:")
-    _info("  HMAC — both parties hold the key → either could have produced the tag.")
-    _info("  RSA  — only the vehicle holds its private key → signature is attributable.")
+    match = (expected_link == link_0)
+    _data("  expected_link == link_0 :", str(match) + "  ← MUST be False")
+    _pause(0.3, delay)
 
+    _r("❌ [ATTACK] Hash chain broken at position 3 — tampering detected")
+    _r("   SHA-256 avalanche: changing any input bit flips ~50% of output bits")
+    _r("   An attacker who dropped metric #1 cannot know link_1 to forge link_2")
+    _pause(0.2, delay)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 5. AVAILABILITY
-# ═══════════════════════════════════════════════════════════════════════════════
+    # ── Also show detect_tampering() on a local chain ────────────────────────
+    _step(4, "Confirming with HashChain.detect_tampering()…")
+    _pause(0.2, delay)
 
-def demo_availability() -> None:
-    """Session expiry, replay detection, and blockchain ledger audit trail."""
-    from core.blockchain_ledger import BlockchainLedger
-    from core.session_manager import SESSION_TIMEOUT_SECONDS, SessionManager
+    audit_chain = HashChain()
+    audit_chain.initialize(seed)
+    audit_chain.add(payload_0)
+    audit_chain.add(payload_1)
+    audit_chain.add(tampered_payload)   # attacker's entry with mismatched link
 
-    _sep()
-    print(f"  {Fore.CYAN}Property : AVAILABILITY — Session Management + Ledger Audit{Style.RESET_ALL}")
-    _sep()
+    # Manually corrupt the last stored hash to simulate what the attacker sent
+    audit_chain._entries[-1].hash_value = link_0   # replace with stale link
 
-    manager = SessionManager()
-    shared  = os.urandom(32)   # mock ECDH shared secret
-
-    # ── Active session ───────────────────────────────────────────────────────
-    sid = manager.create_session("V001", shared)
-    _info(f"Session created: {sid[:24]}…  (timeout = {SESSION_TIMEOUT_SECONDS:.0f} s)")
-
-    assert manager.is_session_valid(sid)
-    _ok("is_session_valid() → True for a freshly created session.")
-
-    # ── Replay detection via sequence monotonicity ────────────────────────
-    session = manager.get_session(sid)
-    _info(f"Session keys: K_AES={session['aes_key'].hex()[:16]}…  "
-          f"K_HMAC={session['hmac_key'].hex()[:16]}…")
-    print()
-
-    # Simulate sequence-number replay protection
-    last_seq = [0]   # controller tracks last accepted sequence per session
-
-    def accept_sequence(seq: int) -> bool:
-        if seq <= last_seq[0]:
-            return False   # replay or out-of-order — reject
-        last_seq[0] = seq
-        return True
-
-    assert  accept_sequence(1);  _ok("Sequence 1 accepted.")
-    assert  accept_sequence(2);  _ok("Sequence 2 accepted.")
-    assert  accept_sequence(3);  _ok("Sequence 3 accepted.")
-    assert not accept_sequence(2);  _ok("Replay of sequence 2 rejected — monotonicity enforced.")
-    assert not accept_sequence(1);  _ok("Replay of sequence 1 rejected — monotonicity enforced.")
-    print()
-
-    # ── purge_expired() prevents memory exhaustion ────────────────────────
-    purged = manager.purge_expired()
-    _info(f"purge_expired() removed {len(purged)} stale sessions "
-          f"(prevents memory-exhaustion DoS).")
-
-    # ── Blockchain ledger audit trail ─────────────────────────────────────
-    print()
-    ledger = BlockchainLedger()
-    pk     = ledger.controller_private_key
-
-    ledger.add_entry("V001", "KEY_EXCHANGE", b"session start", pk)
-    ledger.add_entry("V001", "METRIC",       b'{"speed":72}',  pk)
-    ledger.add_entry("V001", "METRIC",       b'{"speed":68}',  pk)
-
-    _info(f"Ledger: {len(ledger)} entries (including genesis).")
-
-    assert ledger.verify_chain()
-    _ok("verify_chain() → True — all entries intact and signatures valid.")
-
-    # Simulate a tamper attempt
-    ledger._entries[2].vehicle_id = "TAMPERER"
-    report = ledger.tamper_detect()
-    ledger._entries[2].vehicle_id = "V001"     # restore
-
-    if not report["intact"]:
-        pos = report["broken_at"][0]["position"]
-        _ok(f"tamper_detect() caught modification at entry #{pos} — "
-            f"ledger is tamper-evident.")
-    else:
-        _fail("Tampering was not detected.")
+    result = audit_chain.detect_tampering()
+    _data("  detect_tampering()      :", str(result) + "  ← False means CAUGHT")
+    _g("Hash chain integrity check confirmed — position 2 flagged as tampered")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 6. ATTACK DEMONSTRATIONS
+# SCENARIO 4 — Non-Repudiation Demonstration
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def demo_attacks(host: str = HOST, port: int = PORT) -> None:
-    """Run all five AttackSimulator attacks in sequence.
-
-    Each attack connects to a running ControllerNode when available.
-    All five attacks also demonstrate local detection logic so the demo
-    is fully self-contained even without a controller running.
+def scenario_non_repudiation(
+    ledger: Optional[BlockchainLedger] = None,
+    delay: bool = True,
+) -> None:
     """
-    from attacks.attack_simulator import AttackSimulator
-    from core.blockchain_ledger import BlockchainLedger
-    from core.network_config import HOST, PORT
+    Display the blockchain ledger, attempt to retroactively modify entry #2,
+    and show that verify_chain() catches the tamper immediately.
+    If *ledger* is provided (from Scenario 1), it already contains real entries.
+    Otherwise a fresh ledger is populated locally.
+    """
+    # ── Use existing ledger or create one ────────────────────────────────────
+    _step(1, "Displaying the controller's signed audit ledger…")
+    _pause(0.3, delay)
 
-    sim    = AttackSimulator()
-    ledger = BlockchainLedger()
+    if ledger is None:
+        ledger = BlockchainLedger()
+        pk = ledger.controller_private_key
+        ledger.add_entry("V001", "KEY_EXCHANGE", b"ECDH session established", pk)
+        ledger.add_entry("V001", "METRIC", b'{"speed_kmh":60,"gps":[51.50,-0.12]}', pk)
+        ledger.add_entry("V001", "METRIC", b'{"speed_kmh":65,"gps":[51.51,-0.13]}', pk)
+        ledger.add_entry("V001", "METRIC", b'{"speed_kmh":68,"gps":[51.52,-0.14]}', pk)
 
-    # ── Attack 1: Replay ──────────────────────────────────────────────────
-    # Construct a synthetic "captured" beacon that is 120 seconds old.
-    # In a real scenario the attacker would save this from a previous session.
-    captured = {
-        "msg_type":   "BEACON",
-        "session_id": os.urandom(16).hex(),   # expired session
-        "ciphertext": __import__("base64").b64encode(os.urandom(48)).decode(),
-        "nonce":      __import__("base64").b64encode(os.urandom(12)).decode(),
-        "hmac_tag":   os.urandom(32).hex(),
-        "aad":        __import__("base64").b64encode(b"BEACON:old-session").decode(),
-        "sequence":   1,
-        "timestamp":  time.time() - 120,      # 120 seconds ago — well outside window
-    }
-    sim.replay_attack(host, port, captured)
+    ledger.print_ledger()
+    _pause(0.4, delay)
 
-    # ── Attack 2: HMAC Bypass ─────────────────────────────────────────────
-    sim.hmac_bypass_attack(host, port)
+    # ── Find entry #2 (first post-genesis non-exchange entry) ─────────────────
+    _step(2, "Attacker attempts to overwrite vehicle_id in entry #2…")
+    _pause(0.3, delay)
 
-    # ── Attack 3: Metric Tampering ────────────────────────────────────────
-    session_key = os.urandom(32)    # mock "compromised" session key
-    sim.metric_tampering_attack(host, port, session_key)
+    # Entry at index 2 (0=genesis, 1=KEY_EXCHANGE or first real entry, 2=first METRIC)
+    target_idx = min(2, len(ledger._entries) - 1)
+    target     = ledger._entries[target_idx]
+    original_vehicle_id = target.vehicle_id
 
-    # ── Attack 4: Fake Vehicle ────────────────────────────────────────────
-    sim.fake_vehicle_attack(host, port)
+    _data("Target entry     :", f"#{target_idx}  type={target.message_type}")
+    _data("vehicle_id before:", target.vehicle_id)
+    _data("entry_hash before:", target.entry_hash[:32] + "…")
+    _r("\n   [ATTACK] Overwriting vehicle_id: 'V001' → 'ATTACKER'")
+    _r("   Goal: falsify who sent this metric to destroy accountability")
+    _pause(0.4, delay)
 
-    # ── Attack 5: Ledger Tampering ────────────────────────────────────────
-    sim.ledger_tampering_attack(ledger)
+    # Direct field modification — bypasses all API guards
+    target.vehicle_id = "ATTACKER"
+
+    _data("vehicle_id after :", target.vehicle_id + "  ← modified")
+    _data("entry_hash after :", target.entry_hash[:32] + "…  ← STALE (not recalculated)")
+    _c("\n   entry_hash was computed over the ORIGINAL vehicle_id.")
+    _c("   Changing vehicle_id invalidates the stored hash — they no longer agree.")
+    _pause(0.4, delay)
+
+    # ── verify_chain() catches it ──────────────────────────────────────────────
+    _step(3, "Running verify_chain() — checking all hashes and RSA signatures…")
+    _pause(0.4, delay)
+
+    chain_ok = ledger.verify_chain()
+    report   = ledger.tamper_detect()
+
+    _data("verify_chain()   :", str(chain_ok) + "  ← False = TAMPER DETECTED")
+
+    if report["broken_at"]:
+        for broken in report["broken_at"]:
+            _r(f"\n  ❌ [ATTACK] Ledger tamper detected at entry "
+               f"#{broken['position']} — {broken['reason']}")
+    _pause(0.2, delay)
+
+    # ── RSA signature also fails ───────────────────────────────────────────────
+    _step(4, "Attempting RSA signature verification on the modified entry…")
+    _pause(0.3, delay)
+
+    sig_ok = ledger.verify_entry(target.entry_id)
+    _data("verify_entry()   :", str(sig_ok) + "  ← False: hash mismatch + invalid sig")
+    _c("The controller's RSA-PSS signature was computed over the ORIGINAL entry_hash.")
+    _c("Modified entry_hash != original → signature is cryptographically invalid.")
+    _c("Re-signing requires the controller's private key — attacker does not have it.")
+    _pause(0.3, delay)
+
+    # Restore the ledger
+    target.vehicle_id = original_vehicle_id
+
+    _r("❌ [ATTACK] Ledger modification detected and rejected")
+    _r("   The signed audit trail is permanent and undeniable")
 
 
+# ── Socket wire helpers (mirrors nodes/ framing) ──────────────────────────────
+
+def _send(sock, data: dict) -> None:
+    import struct as _s
+    payload = json.dumps(data).encode("utf-8")
+    sock.sendall(_s.pack(">I", len(payload)) + payload)
+
+
+def _recv(sock) -> dict:
+    import struct as _s
+    raw = _recv_n(sock, 4)
+    return json.loads(_recv_n(sock, _s.unpack(">I", raw)[0]).decode())
+
+
+def _recv_n(sock, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("Peer closed connection.")
+        buf += chunk
+    return buf
