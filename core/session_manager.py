@@ -255,3 +255,62 @@ class SessionManager:
         for sid in expired:
             self._sessions.pop(sid, None)
         return expired
+
+
+if __name__ == "__main__":
+    print("=== session_manager self-test ===\n")
+
+    mgr = SessionManager()
+
+    # create_session derives K_AES + K_HMAC from a dummy ECDH shared secret
+    dummy_secret = os.urandom(32)
+    sid = mgr.create_session("V001", dummy_secret)
+    assert len(sid) == 32, "Session ID must be 32 hex chars (128-bit random)"
+    print(f"  create_session       : sid = {sid[:16]}...  [OK]")
+
+    # Session is immediately valid
+    assert mgr.is_session_valid(sid), "Fresh session must be valid"
+    print("  is_session_valid     : fresh session -> True  [OK]")
+
+    # get_session returns a copy with the derived keys
+    rec = mgr.get_session(sid)
+    assert rec is not None
+    assert len(rec["aes_key"])  == 32, "K_AES must be 32 bytes"
+    assert len(rec["hmac_key"]) == 32, "K_HMAC must be 32 bytes"
+    assert rec["aes_key"] != rec["hmac_key"], "K_AES != K_HMAC (key separation)"
+    assert rec["vehicle_id"] == "V001"
+    assert rec["message_count"] == 0
+    print(f"  get_session          : K_AES={rec['aes_key'].hex()[:12]}..., "
+          f"K_HMAC={rec['hmac_key'].hex()[:12]}...  [OK]")
+
+    # increment_message_count
+    mgr.increment_message_count(sid)
+    mgr.increment_message_count(sid)
+    assert mgr.get_session(sid)["message_count"] == 2
+    print("  increment_message_count: count = 2  [OK]")
+
+    # Unknown session ID is invalid
+    assert not mgr.is_session_valid("does-not-exist"), "Unknown sid must be invalid"
+    print("  is_session_valid     : unknown sid -> False  [OK]")
+
+    # Different secrets -> different keys (no key reuse across sessions)
+    sid2 = mgr.create_session("V002", os.urandom(32))
+    rec2 = mgr.get_session(sid2)
+    assert rec2["aes_key"] != rec["aes_key"], "Different secrets -> different K_AES"
+    print("  session isolation    : V001 K_AES != V002 K_AES  [OK]")
+
+    # close_session removes the record
+    final = mgr.close_session(sid)
+    assert final is not None
+    assert mgr.get_session(sid) is None, "Closed session must not be found"
+    print("  close_session        : session removed from store  [OK]")
+
+    # purge_expired — artificially age a session past the timeout
+    sid3 = mgr.create_session("V003", os.urandom(32))
+    mgr._sessions[sid3]["created_at"] -= SESSION_TIMEOUT_SECONDS + 1
+    purged = mgr.purge_expired()
+    assert sid3 in purged, "Over-age session must be purged"
+    assert mgr.get_session(sid3) is None
+    print(f"  purge_expired        : {len(purged)} expired session(s) removed  [OK]")
+
+    print("\n[OK] session_manager — all assertions passed")

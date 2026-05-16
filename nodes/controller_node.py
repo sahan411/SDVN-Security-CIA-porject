@@ -31,6 +31,8 @@ from typing import Optional
 
 from colorama import Fore, Style, init as colorama_init
 
+from cryptography.exceptions import InvalidTag
+
 from core.aes_gcm_encrypt import decrypt
 from core.blockchain_ledger import BlockchainLedger
 from core.hash_chain import HashChain
@@ -351,7 +353,9 @@ class ControllerNode:
                 {"ciphertext": ciphertext, "nonce": nonce},
                 additional_data=aad,
             )
-        except Exception:
+        except (InvalidTag, KeyError, ValueError):
+            # InvalidTag: GCM tag mismatch — ciphertext was modified in transit.
+            # KeyError/ValueError: malformed bundle (missing fields or wrong key length).
             print(f"{Fore.RED}[CONTROLLER]{Style.RESET_ALL} "
                   f"❌ [CONFIDENTIALITY] AES-GCM authentication tag FAILED for "
                   f"Vehicle {vehicle_id} — ciphertext tampered or wrong key.")
@@ -429,7 +433,9 @@ class ControllerNode:
                 {"ciphertext": ciphertext, "nonce": nonce},
                 additional_data=aad,
             )
-        except Exception:
+        except (InvalidTag, KeyError, ValueError):
+            # InvalidTag: ciphertext integrity failure — bundle tampered in transit.
+            # KeyError/ValueError: malformed bundle structure or bad key length.
             print(f"{Fore.RED}[CONTROLLER]{Style.RESET_ALL} "
                   f"❌ [CONFIDENTIALITY] AES-GCM tag FAILED for "
                   f"Vehicle {vehicle_id} — METRIC dropped.")

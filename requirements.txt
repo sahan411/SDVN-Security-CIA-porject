@@ -5,7 +5,8 @@
 # High-level cryptographic primitives: AES-GCM, ECDH, RSA, HMAC, X.509
 cryptography>=42.0.0
 
-# Supplementary symmetric and asymmetric crypto (used for DES/3DES contrast demos)
+# Alternative crypto library — available for AES-CBC / DES comparison exercises
+# that may accompany this project.  Not imported by the core implementation.
 pycryptodome>=3.20.0
 
 # Cross-platform ANSI colour codes for readable demo terminal output

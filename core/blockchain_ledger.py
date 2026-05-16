@@ -28,11 +28,11 @@ Eq 3.31 defines the ledger entry hash construction in SIGMA-V:
     H_i = SHA-256( entry_id_i
                  ‖ vehicle_id_i
                  ‖ message_type_i
-                 ‖ SHA-256(payload_i)       ← payload is hashed, not stored raw
+                 ‖ SHA-256(payload_i)       <- payload is hashed, not stored raw
                  ‖ timestamp_i
-                 ‖ H_{i-1} )               ← chain link to predecessor
+                 ‖ H_{i-1} )               <- chain link to predecessor
 
-    σ_i = RSA-PSS-Sign( K_ctrl_priv , H_i )   ← controller commits to H_i
+    σ_i = RSA-PSS-Sign( K_ctrl_priv , H_i )   <- controller commits to H_i
 
     LedgerEntry_i = ( entry_id_i, vehicle_id_i, message_type_i,
                       SHA-256(payload_i), timestamp_i,
@@ -47,11 +47,11 @@ WHY THE HASH CHAIN MAKES TAMPERING DETECTABLE
 
 Because every H_i commits to H_{i-1}, the chain forms a dependency graph:
 
-    H_0 ← H_1 ← H_2 ← H_3 ← … ← H_n
+    H_0 <- H_1 <- H_2 <- H_3 <- ... <- H_n
               ↑
      altering entry 1 changes H_1
-     → H_2 = SHA-256(… ‖ H_1) no longer matches the stored value of H_2
-     → H_3, H_4, … all mismatch too
+     -> H_2 = SHA-256(... ‖ H_1) no longer matches the stored value of H_2
+     -> H_3, H_4, ... all mismatch too
 
 An auditor who recomputes the chain from the genesis hash will find the first
 divergence at the tampered position without needing to trust any stored value.
@@ -505,9 +505,9 @@ class BlockchainLedger:
             print(f"  {status} #{i:03d}  {entry.message_type:<18}  {ts}")
             print(f"           Vehicle : {entry.vehicle_id}")
             print(f"           Entry ID: {entry.entry_id}")
-            print(f"           Prev  H : {entry.previous_hash[:24]}…")
-            print(f"           Entry H : {entry.entry_hash[:24]}…")
-            print(f"           Sig     : {entry.controller_signature[:24]}…")
+            print(f"           Prev  H : {entry.previous_hash[:24]}...")
+            print(f"           Entry H : {entry.entry_hash[:24]}...")
+            print(f"           Sig     : {entry.controller_signature[:24]}...")
             print()
 
         # Final chain-level verdict.
@@ -558,7 +558,7 @@ class BlockchainLedger:
             json.dumps(document, indent=2),
             encoding="utf-8",
         )
-        print(f"{Fore.CYAN}[LEDGER]{Style.RESET_ALL} Exported {len(self._entries)} entries → {filepath}")
+        print(f"{Fore.CYAN}[LEDGER]{Style.RESET_ALL} Exported {len(self._entries)} entries -> {filepath}")
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
 
@@ -568,5 +568,64 @@ class BlockchainLedger:
     def __repr__(self) -> str:  # noqa: D105
         return (
             f"BlockchainLedger(entries={len(self._entries)}, "
-            f"tip={self._tip_hash()[:16]}…)"
+            f"tip={self._tip_hash()[:16]}...)"
         )
+
+
+if __name__ == "__main__":
+    print("=== blockchain_ledger self-test ===\n")
+
+    ledger = BlockchainLedger()
+    assert len(ledger) == 1, "Genesis block must be created on __init__"
+    priv = ledger.controller_private_key
+    print(f"  __init__             : genesis created, RSA keypair ready  [OK]")
+    print(f"  repr                 : {ledger!r}")
+
+    # Add three entries and verify each individually
+    e1 = ledger.add_entry("V001", "KEY_EXCHANGE",
+                          b"ECDH session established for V001", priv)
+    e2 = ledger.add_entry("V001", "METRIC",
+                          b'{"speed_kmh": 72, "gps": [51.5, -0.12]}', priv)
+    e3 = ledger.add_entry("V001", "METRIC",
+                          b'{"speed_kmh": 68, "gps": [51.51, -0.13]}', priv)
+    assert len(ledger) == 4   # genesis + 3 entries
+    print(f"  add_entry ×3         : ledger has {len(ledger)} entries  [OK]")
+
+    for entry in [e1, e2, e3]:
+        assert ledger.verify_entry(entry.entry_id), \
+            f"Entry {entry.entry_id[:8]} must verify"
+    print("  verify_entry         : all 3 entries individually valid  [OK]")
+
+    # Full chain must be intact
+    assert ledger.verify_chain() is True
+    report = ledger.tamper_detect()
+    assert report["intact"] is True and len(report["broken_at"]) == 0
+    print("  verify_chain         : intact chain -> True  [OK]")
+    print("  tamper_detect        : no broken links found  [OK]")
+
+    # Tamper: overwrite vehicle_id of entry 2
+    original_vid = ledger._entries[2].vehicle_id
+    ledger._entries[2].vehicle_id = "ATTACKER"
+    assert ledger.verify_chain() is False
+    report2 = ledger.tamper_detect()
+    assert not report2["intact"]
+    tampered_pos = report2["broken_at"][0]["position"]
+    tampered_reason = report2["broken_at"][0]["reason"]
+    print(f"  tamper_detect        : tampering caught at pos={tampered_pos}, "
+          f"reason={tampered_reason}  [OK]")
+
+    # Restore and confirm recovery
+    ledger._entries[2].vehicle_id = original_vid
+    assert ledger.verify_chain() is True
+    print("  restore + verify     : chain intact after restore  [OK]")
+
+    # get_entry O(1) lookup
+    fetched = ledger.get_entry(e2.entry_id)
+    assert fetched is e2
+    print("  get_entry            : O(1) lookup by entry_id  [OK]")
+
+    # print_ledger for visual check
+    print()
+    ledger.print_ledger()
+
+    print("[OK] blockchain_ledger — all assertions passed")

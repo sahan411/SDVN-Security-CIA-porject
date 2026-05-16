@@ -39,7 +39,7 @@ Nonce uniqueness requirement  ⚠️
 ----------------------------------
 AES-GCM's security model REQUIRES that the (key, nonce) pair is never reused.
 Reusing a nonce under the same key is catastrophic:
-  • XOR of two ciphertexts = XOR of two plaintexts → both plaintexts leak.
+  • XOR of two ciphertexts = XOR of two plaintexts -> both plaintexts leak.
   • The authentication key H = E_K(0) is exposed, breaking all future tags.
 
 This module generates a fresh 96-bit (12-byte) cryptographically random nonce
@@ -170,3 +170,54 @@ def decrypt(
     # so that security decisions are made at the application layer, not buried.
     plaintext = aesgcm.decrypt(nonce, ciphertext, additional_data)
     return plaintext
+
+
+if __name__ == "__main__":
+    from cryptography.exceptions import InvalidTag
+
+    print("=== aes_gcm_encrypt self-test ===\n")
+
+    KEY       = os.urandom(32)   # fresh AES-256 key for this run
+    PLAINTEXT = b'{"speed_kmh": 72, "gps": [51.5074, -0.1278], "fuel_pct": 80}'
+    AAD       = b"METRIC:demo-session-abc123"
+
+    bundle = encrypt(KEY, PLAINTEXT, additional_data=AAD)
+    assert "ciphertext" in bundle and "nonce" in bundle
+    assert len(bundle["nonce"]) == 12, "Nonce must be 96 bits"
+    assert bundle["tag_length"] == 16, "GCM tag must be 128 bits"
+    print(f"  encrypt         : ciphertext {len(bundle['ciphertext'])} bytes "
+          f"(+16 GCM tag), nonce={bundle['nonce'].hex()}")
+
+    recovered = decrypt(KEY, bundle, additional_data=AAD)
+    assert recovered == PLAINTEXT, "Decrypted plaintext must match original"
+    print("  decrypt         : plaintext recovered correctly  [OK]")
+
+    # Different nonces every call — critical for GCM security
+    bundle2 = encrypt(KEY, PLAINTEXT, additional_data=AAD)
+    assert bundle["nonce"] != bundle2["nonce"], "Each call must use a unique nonce"
+    print("  nonce uniqueness: two encryptions -> different nonces  [OK]")
+
+    # Tampered ciphertext must raise InvalidTag
+    bad_ct = bytearray(bundle["ciphertext"])
+    bad_ct[0] ^= 0xFF   # flip 8 bits in the first byte
+    try:
+        decrypt(KEY, {"ciphertext": bytes(bad_ct), "nonce": bundle["nonce"]}, AAD)
+        raise AssertionError("Should have raised InvalidTag")
+    except InvalidTag:
+        print("  tampered ct     : decrypt raises InvalidTag  [OK]")
+
+    # Wrong AAD must also raise InvalidTag (AAD is bound into the GCM tag)
+    try:
+        decrypt(KEY, bundle, additional_data=b"WRONG:aad")
+        raise AssertionError("Should have raised InvalidTag")
+    except InvalidTag:
+        print("  wrong AAD       : decrypt raises InvalidTag  [OK]")
+
+    # Wrong key length must raise ValueError before any crypto operation
+    try:
+        encrypt(b"short", PLAINTEXT)
+        raise AssertionError("Should have raised ValueError")
+    except ValueError as exc:
+        print(f"  bad key length  : ValueError raised  [OK]  ({exc})")
+
+    print("\n[OK] aes_gcm_encrypt — all assertions passed")

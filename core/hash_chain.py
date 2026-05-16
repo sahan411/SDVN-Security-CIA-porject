@@ -198,3 +198,46 @@ class HashChain:
         if not self._entries:
             return self._genesis_hash
         return self._entries[-1].hash_value
+
+
+if __name__ == "__main__":
+    print("=== hash_chain self-test ===\n")
+
+    chain = HashChain()
+    chain.initialize("shared-genesis-seed")
+    print(f"  initialize      : genesis = {chain.get_tip()[:32]}...")
+
+    h0 = chain.add("metric-payload-0")
+    h1 = chain.add("metric-payload-1")
+    h2 = chain.add("metric-payload-2")
+    assert len(chain) == 3, "Chain must have 3 entries"
+    print(f"  add ×3          : tip = {chain.get_tip()[:32]}...")
+
+    assert chain.verify("metric-payload-0", h0, 0), "Position 0 must verify"
+    assert chain.verify("metric-payload-1", h1, 1), "Position 1 must verify"
+    assert chain.verify("metric-payload-2", h2, 2), "Position 2 must verify"
+    print("  verify          : all 3 positions verified  [OK]")
+
+    assert not chain.verify("metric-payload-0", h1, 0), "Wrong hash at pos 0 must fail"
+    assert not chain.verify("tampered-payload", h0, 0), "Tampered message must fail"
+    print("  verify          : wrong hash / tampered msg -> REJECTED  [OK]")
+
+    assert chain.detect_tampering() is True, "Intact chain must return True"
+    print("  detect_tampering: intact chain -> True  [OK]")
+
+    # Directly overwrite a stored hash to simulate tampering
+    chain._entries[1].hash_value = "0" * 64
+    assert chain.detect_tampering() is False, "Tampered chain must return False"
+    print("  detect_tampering: tampered chain -> False  [OK]")
+
+    # Verify that each link actually commits to its predecessor
+    chain2 = HashChain()
+    chain2.initialize("same-seed")
+    chain3 = HashChain()
+    chain3.initialize("same-seed")
+    link_a = chain2.add("payload")
+    link_b = chain3.add("payload")
+    assert link_a == link_b, "Deterministic: same seed + same message -> same link"
+    print("  determinism     : same seed+msg -> same hash  [OK]")
+
+    print("\n[OK] hash_chain — all assertions passed")

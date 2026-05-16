@@ -40,8 +40,8 @@ Visual HMAC flow
                                          recompute expected_tag
                                                   = HMAC-SHA256(PSK, message)
                                          compare_digest(tag, expected_tag)
-                                              ✓  tags match → message authentic
-                                              ✗  tags differ → DROP + log attack
+                                              [OK]  tags match -> message authentic
+                                              [FAIL]  tags differ -> DROP + log attack
 
 """
 
@@ -106,12 +106,46 @@ def verify_hmac(key: bytes, message: bytes, received_hmac: str) -> bool:
 
         # Constant-time comparison — see Security note in docstring.
         return hmac.compare_digest(expected_tag, received_hmac)
-    except Exception:
-        # Any unexpected error (wrong type, zero-length key, etc.) is treated
-        # as a verification failure rather than an unhandled exception.
+    except (TypeError, ValueError):
+        # TypeError : key or message has wrong type (e.g. str instead of bytes).
+        # ValueError: zero-length key or other hmac parameter constraint violation.
+        # Both are treated as verification failure so callers cannot bypass the
+        # check by passing malformed arguments.
         return False
 
 
 # Alias so demo_scenarios.py can call compute_hmac() without changing the
 # primary public name generate_hmac() used everywhere else.
 compute_hmac = generate_hmac
+
+
+if __name__ == "__main__":
+    print("=== hmac_auth self-test ===\n")
+
+    KEY = b"test-key-32-bytes-padded-000000!"   # 32 bytes
+    MSG = b"speed=72,gps=[51.5074,-0.1278]"
+
+    tag = generate_hmac(KEY, MSG)
+    print(f"  generate_hmac   : {tag[:32]}...")
+    assert len(tag) == 64, "HMAC-SHA256 must produce a 64-char hex string"
+
+    assert verify_hmac(KEY, MSG, tag), "Correct tag must verify"
+    print("  verify_hmac     : correct tag   -> ACCEPTED [OK]")
+
+    tampered_msg = b"speed=99,gps=[99.99,99.99]"
+    assert not verify_hmac(KEY, tampered_msg, tag), "Tampered message must fail"
+    print("  verify_hmac     : tampered msg  -> REJECTED [OK]")
+
+    wrong_tag = "ab" * 32    # valid-length hex, wrong value
+    assert not verify_hmac(KEY, MSG, wrong_tag), "Wrong tag must fail"
+    print("  verify_hmac     : wrong tag     -> REJECTED [OK]")
+
+    wrong_key = b"wrong-key-32-bytes-padded-000000"
+    assert not verify_hmac(wrong_key, MSG, tag), "Wrong key must fail"
+    print("  verify_hmac     : wrong key     -> REJECTED [OK]")
+
+    # Fail-safe: bad argument types return False, not raise
+    assert not verify_hmac(b"k", b"m", 12345), "Non-str tag must return False"
+    print("  verify_hmac     : bad arg type  -> False    [OK]")
+
+    print("\n[PASS] hmac_auth -- all assertions passed")

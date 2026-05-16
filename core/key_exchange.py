@@ -12,14 +12,14 @@ ECDH works over a cyclic group of points on an elliptic curve.  Let G be the
 public generator point and n be the group order (both fixed by the curve spec).
 
     Vehicle  generates:   d_V  ∈ [1, n-1]   (private scalar — random)
-                          Q_V  = d_V · G     (public point)       ← Eq 3.42
+                          Q_V  = d_V · G     (public point)       <- Eq 3.42
 
     Controller generates: d_C  ∈ [1, n-1]   (private scalar — random)
-                          Q_C  = d_C · G     (public point)       ← Eq 3.43
+                          Q_C  = d_C · G     (public point)       <- Eq 3.43
 
     Both parties exchange their public points Q_V and Q_C over the channel.
 
-    Vehicle  computes:    Z = d_V · Q_C  =  d_V · (d_C · G)      ← Eq 3.44
+    Vehicle  computes:    Z = d_V · Q_C  =  d_V · (d_C · G)      <- Eq 3.44
     Controller computes:  Z = d_C · Q_V  =  d_C · (d_V · G)
 
     Because scalar multiplication on an elliptic curve is associative and
@@ -28,7 +28,7 @@ public generator point and n be the group order (both fixed by the curve spec).
     Discrete Logarithm Problem (ECDLP) — believed computationally infeasible
     for 256-bit curves at current computing power.
 
-    Session keys are then derived from Z via HKDF:                 ← Eq 3.45
+    Session keys are then derived from Z via HKDF:                 <- Eq 3.45
         K_AES  = HKDF(Z, salt, info="aes-key")
         K_HMAC = HKDF(Z, salt, info="hmac-key")
 
@@ -69,8 +69,8 @@ It has several properties that make it unsuitable as a direct AES or HMAC key:
        reused as a key in a different protocol context.
 
 HKDF (RFC 5869) solves all three problems in two steps:
-    Extract: PRK = HMAC-SHA256(salt, Z)     → uniform pseudorandom key material
-    Expand : K   = HMAC-SHA256(PRK, info || counter)  → any length, any purpose
+    Extract: PRK = HMAC-SHA256(salt, Z)     -> uniform pseudorandom key material
+    Expand : K   = HMAC-SHA256(PRK, info || counter)  -> any length, any purpose
 
     Different `info` strings ("aes-key", "hmac-key") produce independent,
     domain-separated keys even though they share the same PRK.
@@ -161,7 +161,7 @@ class ECDHKeyExchange:
             forward secrecy.
 
         Corresponds to Eq 3.42 / 3.43 in SIGMA-V FYP:
-            d  ← random scalar in [1, n-1]
+            d  <- random scalar in [1, n-1]
             Q  = d · G   (ephemeral public key)
 
         Why P-256 (secp256r1)?
@@ -283,3 +283,50 @@ class ECDHKeyExchange:
             "aes_key": aes_key,
             "hmac_key": hmac_key,
         }
+
+
+if __name__ == "__main__":
+    print("=== key_exchange self-test ===\n")
+
+    # ── Full ECDH handshake simulation ──────────────────────────────────────
+    vehicle    = ECDHKeyExchange()
+    controller = ECDHKeyExchange()
+
+    vehicle.generate_keypair()
+    controller.generate_keypair()
+
+    v_pub = vehicle.get_public_key_bytes()
+    c_pub = controller.get_public_key_bytes()
+    assert len(v_pub) > 0 and len(c_pub) > 0, "Public keys must be non-empty"
+    print(f"  generate_keypair     : vehicle  pub = {len(v_pub)} bytes (DER)")
+    print(f"  generate_keypair     : ctrl     pub = {len(c_pub)} bytes (DER)")
+
+    # Both sides independently compute the same shared secret (Eq 3.44)
+    v_secret = vehicle.compute_shared_secret(c_pub)
+    c_secret = controller.compute_shared_secret(v_pub)
+    assert v_secret == c_secret, "Shared secrets must match on both sides"
+    print(f"  compute_shared_secret: Z = {v_secret.hex()[:32]}...  (both sides match  [OK])")
+
+    # Each party derives two independent session keys (Eq 3.45)
+    v_keys = vehicle.derive_session_key(v_secret)
+    c_keys = controller.derive_session_key(c_secret)
+    assert v_keys["aes_key"]  == c_keys["aes_key"],  "K_AES must match"
+    assert v_keys["hmac_key"] == c_keys["hmac_key"], "K_HMAC must match"
+    assert v_keys["aes_key"]  != v_keys["hmac_key"], "K_AES != K_HMAC (key separation)"
+    assert len(v_keys["aes_key"])  == 32, "K_AES must be 256 bits"
+    assert len(v_keys["hmac_key"]) == 32, "K_HMAC must be 256 bits"
+    print(f"  derive_session_key   : K_AES  = {v_keys['aes_key'].hex()[:32]}...  [OK]")
+    print(f"  derive_session_key   : K_HMAC = {v_keys['hmac_key'].hex()[:32]}...  [OK]")
+    print(f"  key separation       : K_AES != K_HMAC  [OK]")
+
+    # Different sessions produce different keys (ephemeral property)
+    veh2 = ECDHKeyExchange()
+    ctrl2 = ECDHKeyExchange()
+    veh2.generate_keypair()
+    ctrl2.generate_keypair()
+    s2 = veh2.compute_shared_secret(ctrl2.get_public_key_bytes())
+    keys2 = veh2.derive_session_key(s2)
+    assert keys2["aes_key"] != v_keys["aes_key"], "Different sessions -> different K_AES"
+    print(f"  forward secrecy      : session 2 K_AES != session 1 K_AES  [OK]")
+
+    print("\n[OK] key_exchange — all assertions passed")
